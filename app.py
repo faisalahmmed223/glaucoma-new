@@ -581,15 +581,32 @@ def create_medical_report(data):
 # ==========================================
 @st.cache_resource
 def load_engine():
-    return tf.keras.models.load_model('models/final_glaucoma_deploy_model.keras', compile=False)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "models", "final_glaucoma_deploy_model.keras")
+    return tf.keras.models.load_model(model_path, compile=False)
 
 engine = load_engine()
 prep_func = tf.keras.applications.mobilenet_v2.preprocess_input
 
 def save_to_history(data):
-    df = pd.DataFrame([data])
-    if not os.path.isfile(DB_FILE): df.to_csv(DB_FILE, index=False)
-    else: df.to_csv(DB_FILE, mode='a', header=False, index=False)
+    df_new = pd.DataFrame([data])
+
+    if not os.path.isfile(DB_FILE):
+        df_new.to_csv(DB_FILE, index=False)
+        return
+
+    df = pd.read_csv(DB_FILE)
+
+    # Update existing record(s) for the same Patient_ID + Eye; if none match, append.
+    # This prevents duplicates when the same patient is re-tested.
+    mask = (df["Patient_ID"].astype(str) == str(data["Patient_ID"])) & (df["Eye"].astype(str) == str(data["Eye"]))
+    if mask.any():
+        for col in df_new.columns:
+            df.loc[mask, col] = df_new.iloc[0][col]
+    else:
+        df = pd.concat([df, df_new], ignore_index=True)
+
+    df.to_csv(DB_FILE, index=False)
 
 def apply_clahe_clinical(img):
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
@@ -632,8 +649,14 @@ def generate_gradcam(model, img_array, layer_name):
 # ==========================================
 # 4. SIDEBAR (History & Auto-Update)
 # ==========================================
-if 'p_count' not in st.session_state: st.session_state.p_count = 1001
-if 'processed_flag' not in st.session_state: st.session_state.processed_flag = False
+if 'p_count' not in st.session_state:
+    st.session_state.p_count = 1001
+if 'processed_flag' not in st.session_state:
+    st.session_state.processed_flag = False
+if 'processed_key' not in st.session_state:
+    st.session_state.processed_key = None
+if 'selected_history_row' not in st.session_state:
+    st.session_state.selected_history_row = None
 
 with st.sidebar:
     st.markdown('<div class="status-indicator"><span class="pulse-dot"></span>System Online</div>', unsafe_allow_html=True)
@@ -663,8 +686,42 @@ with st.sidebar:
     st.markdown("<h3 style='color:#60a5fa; font-size:16px; margin-bottom:15px;'>📋 Recent Cases</h3>", unsafe_allow_html=True)
     if os.path.exists(DB_FILE):
         hist_df = pd.read_csv(DB_FILE)
-        display_cols = hist_df[['Patient_ID', 'Eye', 'Result']].tail(8)
-        st.dataframe(display_cols, use_container_width=True, hide_index=True)
+        # Keep only the most recent 12 rows for selection.
+        hist_df = hist_df.tail(12).copy()
+
+        display_labels = []
+        for _, r in hist_df.iterrows():
+            pid = str(r.get("Patient_ID", ""))
+            eye = str(r.get("Eye", ""))
+            res = str(r.get("Result", ""))
+            ts = str(r.get("Timestamp", ""))
+            display_labels.append(f"{pid} | {eye} | {res} | {ts}")
+
+        selection = st.selectbox(
+            "Load selected case into the form",
+            options=["(Select a case)"] + display_labels,
+            index=0,
+            key="history_selectbox",
+            label_visibility="collapsed",
+        )
+
+        if selection != "(Select a case)":
+            # Find the selected row by rebuilding the same label format.
+            # (Avoids fragile indexing if file changes.)
+            match_index = None
+            for i, label in enumerate(display_labels):
+                if label == selection:
+                    match_index = hist_df.index[i]
+                    break
+
+            if match_index is not None:
+                st.session_state.selected_history_row = hist_df.loc[match_index].to_dict()
+            else:
+                st.session_state.selected_history_row = None
+        else:
+            st.session_state.selected_history_row = None
+    else:
+        st.info("No history saved yet.")
 
 # ==========================================
 # 5. MAIN WORKSPACE
@@ -677,18 +734,54 @@ st.markdown("""<div class="header-container">
 st.markdown("### 👤 Patient Information", unsafe_allow_html=True)
 with st.container():
     c1, c2, c3, c4 = st.columns(4, gap="medium")
+
+    history_row = st.session_state.selected_history_row if st.session_state.selected_history_row else {}
+
+    default_pid = history_row.get("Patient_ID", f"PX-{st.session_state.p_count}")
+    default_age = history_row.get("Age", 60)
+    default_eye = history_row.get("Eye", "Right (OD)")
+    default_iop = history_row.get("IOP", 16)
+
     with c1:
         st.markdown("<label class='input-label'>📋 Patient ID</label>", unsafe_allow_html=True)
-        p_id = st.text_input("Patient ID", value=f"PX-{st.session_state.p_count}", label_visibility="collapsed", key="pid", placeholder="PX-1001")
+        p_id = st.text_input(
+            "Patient ID",
+            value=str(default_pid),
+            label_visibility="collapsed",
+            key="pid",
+            placeholder="PX-1001",
+        )
     with c2:
         st.markdown("<label class='input-label'>📅 Age (years)</label>", unsafe_allow_html=True)
-        age = st.number_input("Age", 1, 110, 60, label_visibility="collapsed", key="age", help="Patient age in years")
+        age = st.number_input(
+            "Age",
+            1,
+            110,
+            int(default_age) if str(default_age) != "" else 60,
+            label_visibility="collapsed",
+            key="age",
+            help="Patient age in years",
+        )
     with c3:
         st.markdown("<label class='input-label'>👁️ Laterality</label>", unsafe_allow_html=True)
-        eye = st.selectbox("Target Eye", ["Right (OD)", "Left (OS)"], label_visibility="collapsed", key="eye")
+        eye = st.selectbox(
+            "Target Eye",
+            ["Right (OD)", "Left (OS)"],
+            label_visibility="collapsed",
+            key="eye",
+            index=0 if str(default_eye) == "Right (OD)" else 1,
+        )
     with c4:
         st.markdown("<label class='input-label'>🔬 IOP (mmHg)</label>", unsafe_allow_html=True)
-        iop = st.number_input("IOP", 5, 50, 16, label_visibility="collapsed", key="iop", help="Intraocular pressure measurement")
+        iop = st.number_input(
+            "IOP",
+            5,
+            50,
+            int(default_iop) if str(default_iop) != "" else 16,
+            label_visibility="collapsed",
+            key="iop",
+            help="Intraocular pressure measurement",
+        )
 
 st.markdown("### 🖼️ Fundus Image Upload", unsafe_allow_html=True)
 uploaded_file = st.file_uploader("Drag and drop high-quality fundus image or click to select", type=["jpg", "png", "jpeg"], label_visibility="collapsed", help="Upload a high-quality fundus photograph for analysis")
@@ -719,19 +812,27 @@ if uploaded_file:
         risk_level = "VERY LOW"
         confidence_clinical = "High confidence"
 
-    # --- AUTO-SAVE LOGIC ---
-    current_key = f"{p_id}_{eye}_{uploaded_file.name}"
+    # --- AUTO-SAVE LOGIC (safe update, no duplicates) ---
+    # Use (Patient_ID + Eye) as the update identity; prevent re-saving the exact same run.
+    current_key = f"{p_id}|{eye}|{uploaded_file.name}"
 
-    if not st.session_state.processed_flag:
+    should_save = (st.session_state.processed_key != current_key)
+    if should_save:
         db_entry = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "Patient_ID": p_id, "Age": age, "Eye": eye, "IOP": iop,
-            "Prob": f"{glaucoma_prob*100:.1f}%", "Result": diag_result,
-            "Risk_Level": risk_level, "Confidence": confidence_clinical
+            "Patient_ID": str(p_id),
+            "Age": int(age),
+            "Eye": str(eye),
+            "IOP": float(iop),
+            "Prob": f"{glaucoma_prob*100:.1f}%",
+            "Result": diag_result,
+            "Risk_Level": risk_level,
+            "Confidence": confidence_clinical,
         }
         save_to_history(db_entry)
         st.session_state.processed_flag = True
-        st.toast(f"✓ Record logged for {p_id} | Risk: {risk_level}", icon="💾")
+        st.session_state.processed_key = current_key
+        st.toast(f"✓ Saved/Updated {p_id} | {eye} | Risk: {risk_level}", icon="💾")
 
     # Tabs
     t1, t2, t3 = st.tabs(["📊 Diagnostic Results", "🔬 Neural Explainability", "📑 Clinical Report"])
